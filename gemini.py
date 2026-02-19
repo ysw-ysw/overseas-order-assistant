@@ -21,16 +21,19 @@ KOR_TO_ENG_DICT = {
     "맥시": "MAXI-HGH", "미토": "MITO-FUEL", "글루타치온": "GLUTATHIONE", "밀믹스": "MEAL MIX"
 }
 
-# --- 2. 구글 시트 연결 (Base64 압축 해제 방식) ---
+# --- 2. 구글 시트 연결 (최강 보정 버전) ---
 def connect_google_sheet():
     try:
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         
-        # Secrets에서 압축된 한 줄짜리 키를 가져옵니다.
+        # Secrets에서 압축된 키를 가져옵니다.
         encoded_key = st.secrets["ENCODED_KEY"]
         
-        # Base64 압축을 풀고 JSON으로 변환합니다.
-        decoded_key = base64.b64decode(encoded_key).decode("utf-8")
+        # [핵심 보정] 복사 과정에서 섞일 수 있는 모든 공백, 줄바꿈, 탭 문자를 완벽히 제거합니다.
+        cleaned_key = "".join(encoded_key.split())
+        
+        # Base64 압축 해제 및 JSON 변환
+        decoded_key = base64.b64decode(cleaned_key).decode("utf-8")
         key_dict = json.loads(decoded_key)
         
         creds = ServiceAccountCredentials.from_json_keyfile_dict(key_dict, scope)
@@ -190,3 +193,4 @@ if uploaded:
         with pd.ExcelWriter(towrap, engine='openpyxl') as writer: edited_df.to_excel(writer, index=False)
         st.download_button("💾 가공 주문서 다운로드", towrap.getvalue(), file_name=f"처리완료_{uploaded.name}")
     with col_b: components.iframe("https://gsiexpress.com/pcc_chk.php", height=450, scrolling=True)
+
