@@ -1,157 +1,186 @@
 import streamlit as st
 import pandas as pd
-import os
 import re
+import gspread
+import io
+from datetime import datetime
+from oauth2client.service_account import ServiceAccountCredentials
 import streamlit.components.v1 as components
 
-# --- 1. 상품명 매핑 데이터 ---
-MAPPING_DICT = {
-    "싱크": "6234726923", "렙틴": "22", "리포조말 비타민C": "82", "비타민D": "121",
-    "엘테아닌": "84", "자몽씨": "116", "ND50": "21", "ND120": "21-1",
-    "엔자임": "6236015197", "브레인": "91", "마이타케": "40", "이뮤노": "16",
-    "콜라겐": "10", "파우더": "115", "네츄럴 비타민E": "81", "레스베라": "5050",
-    "코큐텐": "32", "아드레날": "11111", "이노시톨": "22222", "커큐민": "33333",
-    "맥시": "44444", "미토": "55555", "글루타치온": "66666", "밀믹스": "P3"
+# --- 1. 상품 매핑 데이터 ---
+KOR_TO_ENG_DICT = {
+    "싱크": "SYNC UP", "렙틴": "ADIPO-LEPTIN BENEFITS", "리포조말 비타민C": "LIPOSOMAL C",
+    "비타민D": "LIQUID D3 10000 IU", "엘테아닌": "L-THEANINE", "자몽씨": "GRAPEFRUIT SEED EXTRACT 400MG",
+    "ND50": "MEGA PROBIOTIC™ ND 50", "ND120": "MEGA PROBIOTIC™ ND", "엔자임": "ENZYME BENEFITS",
+    "브레인": "BRAIN BENEFITS", "마이타케": "MAITAKE-DMG LIQUID", "이뮤노": "IMMUNO BENEFITS",
+    "콜라겐": "NATURE'S COLLAGEN", "파우더": "L-GLUTAMINE POWDER", "네츄럴": "NATURAL MIXED TOCOPHEROL E-400",
+    "레스베라": "RESVERATROL-50", "코큐텐": "COQ10-DMG 300/300", 
+    "아드레날": "ADRENALYZE", "이노시톨": "INOSITOL+VITEX PLUS", "커큐민": "CURCUMIN C3 COMPLEX",
+    "맥시": "MAXI-HGH", "미토": "MITO-FUEL", "글루타치온": "GLUTATHIONE", "밀믹스": "MEAL MIX"
 }
 
-# --- 2. 보조 함수 로직 ---
+# --- 2. 구글 시트 연결 ---
+def connect_google_sheet():
+    try:
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds = ServiceAccountCredentials.from_json_keyfile_name("google_key.json", scope)
+        client = gspread.authorize(creds)
+        doc = client.open_by_key("17-7C-Ut21uGF_IpAd3H25VEK9wUW0J9uYKcwbxTvJeQ")
+        return doc.worksheet("재고내역"), doc.worksheet("출고기록")
+    except Exception as e:
+        st.error(f"❌ 시트 연결 실패: {e}"); return None, None
+
+# --- 3. 데이터 정제 및 검수 로직 (노란색 강조용) ---
 def format_phone_number(phone):
-    if pd.isna(phone) or str(phone).strip() in ["", "nan"]:
-        return phone
-    clean_number = re.sub(r'\D', '', str(phone))
-    if len(clean_number) == 11 and clean_number.startswith('010'):
-        return f"{clean_number[0:3]}-{clean_number[3:7]}-{clean_number[7:11]}"
-    elif len(clean_number) == 10 and clean_number.startswith('010'):
-        return f"{clean_number[0:3]}-{clean_number[3:6]}-{clean_number[6:10]}"
+    if pd.isna(phone) or str(phone).strip() in ["", "nan"]: return phone
+    clean = re.sub(r'\D', '', str(phone))
+    if len(clean) == 11 and clean.startswith('010'): return f"{clean[0:3]}-{clean[3:7]}-{clean[7:11]}"
     return phone
 
 def clean_check_text(val, is_pcc=False):
     text = str(val).replace('(check) ', '').replace('(check)', '').replace('[누락]', '').strip()
-    text = re.sub(r'\[합계:\d+개\] ', '', text)
-    if is_pcc and (not text or text.lower() == "nan" or text == "None"):
-        return "(check)"
-    return text
+    return "(check)" if is_pcc and (not text or text.lower() == "nan") else text
 
-# --- 3. 데이터 가공 함수 ---
 def process_excel(df):
     df = df.copy()
-    
     if '우편번호' in df.columns:
-        df['우편번호'] = df['우편번호'].apply(lambda x: str(int(float(x))).zfill(5) if pd.notnull(x) and str(x).strip() not in ["", "nan"] else "")
-    if '배송방법' in df.columns:
-        df = df.drop(columns=['배송방법'])
-    
-    if '쇼핑몰주문번호' in df.columns:
-        idx = df.columns.get_loc('쇼핑몰주문번호') + 1
-        split_data = df['쇼핑몰주문번호'].astype(str).str.split(' ', n=1, expand=True)
-        detail_val = split_data[1] if split_data.shape[1] > 1 else ""
-        if '주문번호상세' not in df.columns: df.insert(idx, '주문번호상세', detail_val)
-        df['쇼핑몰주문번호'] = split_data[0]
-
+        df['우편번호'] = df['우편번호'].apply(lambda x: str(int(float(x))).zfill(5) if pd.notnull(x) else "")
     for col in ['수령자휴대폰번호', '주문자전화번호']:
         if col in df.columns: df[col] = df[col].apply(format_phone_number)
-
     if '옵션' in df.columns and '주문수량' in df.columns:
         df['주문수량'] = pd.to_numeric(df['주문수량'], errors='coerce').fillna(1).astype(int)
-        mask_3ea = df['옵션'].astype(str).str.contains('3개')
-        df.loc[mask_3ea, '주문수량'] *= 3
-
+        df.loc[df['옵션'].astype(str).str.contains('3개'), '주문수량'] *= 3
+    
+    # 중복 체크 (합계 6개 초과)
     if all(c in df.columns for c in ['수령자명', '수령자휴대폰번호', '주소']):
         total_qty = df.groupby(['수령자명', '수령자휴대폰번호', '주소'])['주문수량'].transform('sum')
         mask_over_6 = total_qty > 6
-    else:
-        mask_over_6 = pd.Series([False] * len(df)); total_qty = pd.Series([0] * len(df))
+    else: mask_over_6 = pd.Series([False] * len(df))
 
     for i, row in df.iterrows():
+        # [A] 이름 불일치
         if str(row.get('주문자명')) != str(row.get('수령자명')):
-            df.at[i, '주문자명'] = f"(check) {row.get('주문자명', '')}"; df.at[i, '수령자명'] = f"(check) {row.get('수령자명', '')}"
-        
-        product_name = str(row.get('온라인상품명', ""))
-        for key, val in MAPPING_DICT.items():
-            if key in product_name:
-                df.at[i, '상품번호'] = val
-                break
-        
-        r_phone, o_phone = str(df.at[i, '수령자휴대폰번호']), str(df.at[i, '주문자전화번호'])
-        if r_phone != o_phone or (r_phone != "" and not r_phone.startswith("010")):
-            df.at[i, '수령자휴대폰번호'] = f"(check) {r_phone}"
-        
+            df.at[i, '수령자명'] = f"(check) {row.get('수령자명', '')}"
+        # [B] 전화번호 숫자 비교
+        r_raw, o_raw = str(row.get('수령자휴대폰번호', "")), str(row.get('주문자전화번호', ""))
+        if re.sub(r'\D', '', r_raw) != re.sub(r'\D', '', o_raw) and o_raw not in ["", "nan"]:
+            df.at[i, '수령자휴대폰번호'] = f"(check) {format_phone_number(r_raw)}"
+        # [C] 통관번호 누락/오류
         pccc = str(row.get('개인통관번호', "")).strip()
-        if pccc == "" or pccc.lower() in ["nan", "none"]: df.at[i, '개인통관번호'] = "(check) [누락]"
-        elif not pccc.upper().startswith('P'): df.at[i, '개인통관번호'] = f"(check) {pccc}"
-            
-        df.at[i, '매입처주소'] = row.get('주소')
+        if pccc == "" or pccc.lower() in ["nan", "none"] or not pccc.upper().startswith('P'):
+            df.at[i, '개인통관번호'] = f"(check) {pccc}"
+        # [D] 수량 초과
         if mask_over_6.at[i]:
             df.at[i, '주문수량'] = f"(check) [합계:{int(total_qty.at[i])}개] {df.at[i, '주문수량']}"
-            
     return df
 
-# --- 4. UI 구성 ---
-st.set_page_config(page_title="해외주문처리 비서", layout="wide")
-st.title("📦 해외주문처리 비서")
+# --- 4. FIFO 분석 로직 ---
+def analyze_fifo_stock(order_df, ws_inv):
+    all_inv_data = ws_inv.get_all_values()
+    # 열 위치: A(0)입고일, D(3)상품명, H(7)입고수, I(8)출고수, K(10)재고수, L(11)트래킹
+    IDX_DATE_IN, IDX_PROD, IDX_IN, IDX_OUT, IDX_STOCK, IDX_TRACK = 0, 3, 7, 8, 10, 11
+    
+    inv_data = []
+    for i, row in enumerate(all_inv_data[1:], start=2):
+        if len(row) < 12: continue
+        inv_data.append(row + [i])
+    
+    temp_inv_df = pd.DataFrame(inv_data)
+    temp_inv_df[IDX_DATE_IN] = pd.to_datetime(temp_inv_df[IDX_DATE_IN], errors='coerce')
+    temp_inv_df = temp_inv_df.sort_values(by=IDX_DATE_IN)
 
-uploaded_file = st.file_uploader("📂 엑셀 파일을 업로드하세요", type=["xlsx", "xls"])
+    preview_rows, task_list, board_msgs = [], [], []
+    today = datetime.now().strftime('%Y-%m-%d')
 
-if uploaded_file:
-    if "current_filename" not in st.session_state or st.session_state.current_filename != uploaded_file.name:
-        st.session_state.processed_df = process_excel(pd.read_excel(uploaded_file))
-        st.session_state.current_filename = uploaded_file.name
-        st.session_state.val_text = ""
+    for _, order in order_df.iterrows():
+        name = clean_check_text(order['수령자명'])
+        eng_name = next((v for k, v in KOR_TO_ENG_DICT.items() if k in str(order['온라인상품명'])), "알수없음")
+        raw_q = str(order['주문수량'])
+        qty_needed = int(re.search(r'\d+', str(raw_q).split(']')[-1]).group()) if ']' in str(raw_q) else int(re.search(r'\d+', str(raw_q)).group() if re.search(r'\d+', str(raw_q)) else 1)
+        
+        if eng_name == "알수없음": continue
+        matches = temp_inv_df[temp_inv_df[IDX_PROD].str.strip() == eng_name]
+        order_msg = [f"◾{name}"]
 
-    df = st.session_state.processed_df
+        for idx, row in matches.iterrows():
+            if qty_needed <= 0: break
+            s_in, s_out = float(row[IDX_IN] or 0), float(row[IDX_OUT] or 0)
+            current_stock = s_in - s_out
+            if current_stock > 0:
+                take = min(qty_needed, current_stock)
+                new_out, new_stock = s_out + take, s_in - (s_out + take)
+                preview_rows.append({"수령자": name, "상품명": eng_name, "현재고": int(current_stock), "출고": int(take), "잔여": int(new_stock), "트래킹": row[IDX_TRACK], "입고일": row[IDX_DATE_IN].strftime('%Y-%m-%d')})
+                task_list.append({'row': row.iloc[-1], 'updates': [(9, new_out, s_out), (11, new_stock, current_stock)], 'log': [today, name, eng_name, int(take), int(new_stock), row[IDX_TRACK], row[IDX_DATE_IN].strftime('%Y-%m-%d')]})
+                order_msg.append(f"- {eng_name}/{row[IDX_TRACK]}/{int(take)}")
+                temp_inv_df.at[idx, IDX_OUT] = str(new_out); qty_needed -= take
+        
+        if len(order_msg) > 1: board_msgs.append("\n".join(order_msg))
+            
+    return pd.DataFrame(preview_rows), task_list, "\n\n".join(board_msgs)
+
+# --- 5. UI 메인 ---
+st.set_page_config(page_title="해외주문 비서 v13.0", layout="wide")
+st.title("📦 해외주문처리 비서 (v13.0 전체 통합본)")
+
+uploaded = st.file_uploader("📂 플레이오토 엑셀 파일 업로드", type=["xlsx"])
+
+if uploaded:
+    if "df" not in st.session_state or st.session_state.fname != uploaded.name:
+        st.session_state.df = process_excel(pd.read_excel(uploaded))
+        st.session_state.fname = uploaded.name
+        st.session_state.last_tasks = []
+
+    # [1] 필수 검수 항목 섹션 (복구 완료!)
+    df = st.session_state.df
     check_rows = df[df.astype(str).apply(lambda row: row.str.contains('\(check\)').any(), axis=1)]
-    option_3_rows = df[df['옵션'].astype(str).str.contains('3개')]
-
-    # 1. 필수 검수 항목 (위)
     st.subheader(f"⚠️ 필수 검수 항목 ({len(check_rows)}건)")
     if not check_rows.empty:
         st.dataframe(check_rows.style.applymap(lambda x: 'background-color: #FFEB3B' if '(check)' in str(x) else ''), use_container_width=True)
-    else:
-        st.success("필수 검수 항목이 없습니다.")
+    else: st.success("✅ 모든 데이터가 정상입니다.")
 
     st.markdown("---")
+    edited_df = st.data_editor(df, use_container_width=True, key="main_editor")
 
-    # 2. 수량 배수 적용 내역 (아래)
-    st.subheader(f"🔢 수량 배수(3개) 적용 내역 ({len(option_3_rows)}건)")
-    if not option_3_rows.empty:
-        st.dataframe(option_3_rows[['수령자명', '온라인상품명', '옵션', '주문수량']], use_container_width=True)
-    else:
-        st.write("적용 내역이 없습니다.")
-
+    # [2] 재고 차감 시뮬레이션 및 승인 섹션
     st.markdown("---")
-    st.subheader("📝 데이터 편집기 (최종 수정)")
-    edited_df = st.data_editor(df, use_container_width=True, num_rows="dynamic", key="main_editor")
+    if st.button("🔍 재고 차감 시뮬레이션 실행"):
+        ws_inv, _ = connect_google_sheet()
+        if ws_inv:
+            pre_df, tasks, msgs = analyze_fifo_stock(edited_df, ws_inv)
+            st.session_state.pre_df, st.session_state.tasks, st.session_state.msgs = pre_df, tasks, msgs
 
-    # 3. 통관번호 실시간 검증 도우미 (복구 완료!)
+    if "pre_df" in st.session_state:
+        st.subheader("📋 출고 예정 미리보기")
+        st.dataframe(st.session_state.pre_df, use_container_width=True)
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("🚀 전체 출고 승인 (시트 반영)"):
+                ws_i, ws_s = connect_google_sheet()
+                for t in st.session_state.tasks:
+                    for col, val, _ in t['updates']: ws_i.update_cell(t['row'], col, val)
+                ws_s.append_rows([t['log'] for t in st.session_state.tasks])
+                st.session_state.last_tasks = st.session_state.tasks
+                st.success("🎉 반영 완료!"); st.balloons()
+                st.text_area("📋 고배송 게시판 문구:", st.session_state.msgs, height=300)
+        with c2:
+            if st.session_state.last_tasks and st.button("🔙 방금 작업 롤백"):
+                ws_i, _ = connect_google_sheet()
+                for t in st.session_state.last_tasks:
+                    for col, _, old_val in t['updates']: ws_i.update_cell(t['row'], col, old_val)
+                st.session_state.last_tasks = []
+                st.warning("⏪ 재고 롤백 완료! (출고기록은 수동 삭제 필요)")
+
+    # [3] 통관 검증 및 다운로드 섹션 (복구 완료!)
     st.markdown("---")
-    st.subheader("🛡️ 통관번호 실시간 검증 도우미")
-    
-    col_v, col_site = st.columns([1, 1.5])
-    
-    with col_v:
+    st.subheader("🔍 통관 검증 및 최종 파일")
+    col_a, col_b = st.columns([1, 1.5])
+    with col_a:
         if st.button("🔗 검증용 텍스트 생성"):
-            v_list = []
-            for _, row in edited_df.iterrows():
-                name = clean_check_text(row.get('수령자명', ''))
-                pcc = clean_check_text(row.get('개인통관번호', ''), is_pcc=True)
-                phone = clean_check_text(row.get('수령자휴대폰번호', ''))
-                zip_c = clean_check_text(row.get('우편번호', ''))
-                if name or pcc: v_list.append(f"{name}/{pcc}/{phone}/{zip_c}")
-            st.session_state.val_text = "\n".join(v_list)
+            v_list = [f"{clean_check_text(r['수령자명'])}/{clean_check_text(r['개인통관번호'], True)}/{clean_check_text(r['수령자휴대폰번호'])}/{r.get('우편번호','')}" for _, r in edited_df.iterrows()]
+            st.text_area("GSI 검증 텍스트:", "\n".join(v_list), height=250)
         
-        if st.session_state.get('val_text'):
-            st.text_area("GSI 검증용 텍스트 (복사해서 오른쪽 사이트에 붙여넣으세요):", st.session_state.val_text, height=450)
-            st.info("💡 텍스트 영역 클릭 후 Ctrl+A, Ctrl+C로 복사하세요.")
+        towrap = io.BytesIO()
+        with pd.ExcelWriter(towrap, engine='openpyxl') as writer: edited_df.to_excel(writer, index=False)
+        st.download_button("💾 가공 주문서 다운로드", towrap.getvalue(), file_name=f"처리완료_{uploaded.name}")
 
-    with col_site:
-        st.write("🌐 GSI 익스프레스 사이트")
-        components.iframe("https://gsiexpress.com/pcc_chk.php", height=600, scrolling=True)
-
-    # 4. 최종 저장
-    st.markdown("---")
-    if st.button("🚀 최종 결과물 다운로드"):
-        output_name = f"처리완료_{uploaded_file.name}"
-        edited_df.to_excel(output_name, index=False)
-        st.balloons()
-        with open(output_name, "rb") as f:
-            st.download_button("💾 엑셀 파일 받기", f, file_name=output_name)
+    with col_b: components.iframe("https://gsiexpress.com/pcc_chk.php", height=500, scrolling=True)
