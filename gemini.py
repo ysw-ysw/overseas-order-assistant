@@ -3,6 +3,8 @@ import pandas as pd
 import re
 import gspread
 import io
+import base64
+import json
 from datetime import datetime
 from oauth2client.service_account import ServiceAccountCredentials
 import streamlit.components.v1 as components
@@ -19,35 +21,29 @@ KOR_TO_ENG_DICT = {
     "맥시": "MAXI-HGH", "미토": "MITO-FUEL", "글루타치온": "GLUTATHIONE", "밀믹스": "MEAL MIX"
 }
 
-# --- 2. 구글 시트 연결 (Streamlit Secrets 보안 방식) ---
+# --- 2. 구글 시트 연결 (Base64 압축 해제 방식) ---
 def connect_google_sheet():
     try:
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         
-        # 1. Secrets에서 데이터를 딕셔너리로 가져옵니다.
-        key_info = dict(st.secrets["gcp_service_account"])
+        # Secrets에서 압축된 한 줄짜리 키를 가져옵니다.
+        encoded_key = st.secrets["ENCODED_KEY"]
         
-        # 2. [필살기] private_key에 섞인 온갖 오타(공백, 이중줄바꿈 등)를 비서가 직접 청소합니다.
-        if "private_key" in key_info:
-            pk = key_info["private_key"]
-            # 리터럴 \n 문자를 실제 줄바꿈으로 변경
-            pk = pk.replace("\\n", "\n")
-            # 앞뒤 공백 및 불필요한 빈 줄 완벽 제거
-            pk = pk.strip()
-            key_info["private_key"] = pk
-            
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(key_info, scope)
+        # Base64 압축을 풀고 JSON으로 변환합니다.
+        decoded_key = base64.b64decode(encoded_key).decode("utf-8")
+        key_dict = json.loads(decoded_key)
+        
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(key_dict, scope)
         client = gspread.authorize(creds)
         
         # 원과호 시트 고유 ID
         doc = client.open_by_key("17-7C-Ut21uGF_IpAd3H25VEK9wUW0J9uYKcwbxTvJeQ")
         return doc.worksheet("재고내역"), doc.worksheet("출고기록")
     except Exception as e:
-        # 에러 메시지를 더 자세히 보여주도록 수정
         st.error(f"❌ 시트 연결 실패: {e}")
         return None, None
 
-# --- 3. 데이터 정제 및 검수 로직 ---
+# --- 3. 데이터 정제 로직 ---
 def format_phone_number(phone):
     if pd.isna(phone) or str(phone).strip() in ["", "nan"]: return phone
     clean = re.sub(r'\D', '', str(phone))
@@ -133,8 +129,8 @@ def analyze_fifo_stock(order_df, ws_inv):
     return pd.DataFrame(preview_rows), task_list, "\n\n".join(board_msgs)
 
 # --- 5. UI 메인 ---
-st.set_page_config(page_title="원과호 비서 v15.0", layout="wide")
-st.title("📦 원과호 해외주문처리 비서 (v15.0 보안 강화)")
+st.set_page_config(page_title="원과호 비서 v16.0", layout="wide")
+st.title("📦 원과호 해외주문처리 비서 (v16.0 완결판)")
 
 uploaded = st.file_uploader("📂 플레이오토 엑셀 파일 업로드", type=["xlsx"])
 
@@ -194,5 +190,3 @@ if uploaded:
         with pd.ExcelWriter(towrap, engine='openpyxl') as writer: edited_df.to_excel(writer, index=False)
         st.download_button("💾 가공 주문서 다운로드", towrap.getvalue(), file_name=f"처리완료_{uploaded.name}")
     with col_b: components.iframe("https://gsiexpress.com/pcc_chk.php", height=450, scrolling=True)
-
-
