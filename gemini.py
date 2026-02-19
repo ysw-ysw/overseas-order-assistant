@@ -19,22 +19,26 @@ KOR_TO_ENG_DICT = {
     "맥시": "MAXI-HGH", "미토": "MITO-FUEL", "글루타치온": "GLUTATHIONE", "밀믹스": "MEAL MIX"
 }
 
-# --- 2. 구글 시트 연결 (보안 금고 st.secrets 적용) ---
+# --- 2. 구글 시트 연결 (Streamlit Secrets 보안 방식) ---
 def connect_google_sheet():
     try:
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         
-        # [수정된 부분] 파일 대신 Streamlit Secrets에서 보안 키를 불러옵니다.
-        key_dict = dict(st.secrets["gcp_service_account"])
-        
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(key_dict, scope)
+        # [수정] Secrets에서 데이터를 딕셔너리로 가져온 뒤 줄바꿈(\n) 오류를 보정합니다.
+        key_info = dict(st.secrets["gcp_service_account"])
+        if "private_key" in key_info:
+            # 복사 과정에서 생길 수 있는 \n 문자열 꼬임을 방지합니다.
+            key_info["private_key"] = key_info["private_key"].replace("\\n", "\n")
+            
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(key_info, scope)
         client = gspread.authorize(creds)
         
         # 원과호 시트 고유 ID
         doc = client.open_by_key("17-7C-Ut21uGF_IpAd3H25VEK9wUW0J9uYKcwbxTvJeQ")
         return doc.worksheet("재고내역"), doc.worksheet("출고기록")
     except Exception as e:
-        st.error(f"❌ 시트 연결 실패: {e}\n(Streamlit Settings > Secrets 설정을 확인해 주세요.)")
+        st.error(f"❌ 시트 연결 실패: {e}")
+        st.info("💡 Streamlit Settings > Secrets 설정이 올바른지 확인해주세요.")
         return None, None
 
 # --- 3. 데이터 정제 및 검수 로직 ---
@@ -58,7 +62,6 @@ def process_excel(df):
         df['주문수량'] = pd.to_numeric(df['주문수량'], errors='coerce').fillna(1).astype(int)
         df.loc[df['옵션'].astype(str).str.contains('3개'), '주문수량'] *= 3
     
-    # 중복 체크 및 6개 초과 마킹
     if all(c in df.columns for c in ['수령자명', '수령자휴대폰번호', '주소']):
         total_qty = df.groupby(['수령자명', '수령자휴대폰번호', '주소'])['주문수량'].transform('sum')
         mask_over_6 = total_qty > 6
@@ -77,10 +80,9 @@ def process_excel(df):
             df.at[i, '주문수량'] = f"(check) [합계:{int(total_qty.at[i])}개] {df.at[i, '주문수량']}"
     return df
 
-# --- 4. FIFO 분석 및 시뮬레이션 (NaT 에러 방지 반영) ---
+# --- 4. FIFO 분석 및 시뮬레이션 ---
 def analyze_fifo_stock(order_df, ws_inv):
     all_inv_data = ws_inv.get_all_values()
-    # 열: A(입고일), D(상품명), H(입고수), I(출고수), K(재고수), L(트래킹)
     IDX_DATE_IN, IDX_PROD, IDX_IN, IDX_OUT, IDX_STOCK, IDX_TRACK = 0, 3, 7, 8, 10, 11
     
     inv_data = []
@@ -112,8 +114,6 @@ def analyze_fifo_stock(order_df, ws_inv):
             if current_stock > 0:
                 take = min(qty_needed, current_stock)
                 new_out, new_stock = s_out + take, s_in - (s_out + take)
-                
-                # 날짜 NaT 체크
                 in_date = row[IDX_DATE_IN]
                 date_str = in_date.strftime('%Y-%m-%d') if pd.notnull(in_date) else "날짜없음"
                 
@@ -127,8 +127,8 @@ def analyze_fifo_stock(order_df, ws_inv):
     return pd.DataFrame(preview_rows), task_list, "\n\n".join(board_msgs)
 
 # --- 5. UI 메인 ---
-st.set_page_config(page_title="원과호 비서 v14.0", layout="wide")
-st.title("📦 원과호 해외주문처리 비서 (v14.0 클라우드)")
+st.set_page_config(page_title="원과호 비서 v15.0", layout="wide")
+st.title("📦 원과호 해외주문처리 비서 (v15.0 보안 강화)")
 
 uploaded = st.file_uploader("📂 플레이오토 엑셀 파일 업로드", type=["xlsx"])
 
@@ -139,8 +139,6 @@ if uploaded:
         st.session_state.last_tasks = []
 
     df = st.session_state.df
-    
-    # [1] 상단 검수 항목
     check_rows = df[df.astype(str).apply(lambda row: row.str.contains('\(check\)').any(), axis=1)]
     with st.expander(f"⚠️ 필수 검수 항목 ({len(check_rows)}건)", expanded=not check_rows.empty):
         if not check_rows.empty:
@@ -150,7 +148,6 @@ if uploaded:
     st.markdown("---")
     edited_df = st.data_editor(df, use_container_width=True, key="main_editor")
 
-    # [2] 재고 시뮬레이션 및 승인
     st.markdown("---")
     if st.button("🔍 재고 차감 시뮬레이션 실행"):
         ws_inv, _ = connect_google_sheet()
@@ -180,8 +177,8 @@ if uploaded:
                 st.session_state.last_tasks = []
                 st.warning("⏪ 재고 롤백 완료!")
 
-    # [3] 통관 검증 및 다운로드
     st.markdown("---")
+    st.subheader("🔍 통관 검증 및 최종 파일")
     col_a, col_b = st.columns([1, 1.5])
     with col_a:
         if st.button("🔗 검증용 텍스트 생성"):
