@@ -7,7 +7,7 @@ from datetime import datetime
 from oauth2client.service_account import ServiceAccountCredentials
 import streamlit.components.v1 as components
 
-# --- 1. 상품 매핑 데이터 ---
+# --- 1. 상품 매핑 데이터 (원과호 전용) ---
 KOR_TO_ENG_DICT = {
     "싱크": "SYNC UP", "렙틴": "ADIPO-LEPTIN BENEFITS", "리포조말 비타민C": "LIPOSOMAL C",
     "비타민D": "LIQUID D3 10000 IU", "엘테아닌": "L-THEANINE", "자몽씨": "GRAPEFRUIT SEED EXTRACT 400MG",
@@ -19,18 +19,25 @@ KOR_TO_ENG_DICT = {
     "맥시": "MAXI-HGH", "미토": "MITO-FUEL", "글루타치온": "GLUTATHIONE", "밀믹스": "MEAL MIX"
 }
 
-# --- 2. 구글 시트 연결 ---
+# --- 2. 구글 시트 연결 (보안 금고 st.secrets 적용) ---
 def connect_google_sheet():
     try:
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name("google_key.json", scope)
+        
+        # [수정된 부분] 파일 대신 Streamlit Secrets에서 보안 키를 불러옵니다.
+        key_dict = dict(st.secrets["gcp_service_account"])
+        
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(key_dict, scope)
         client = gspread.authorize(creds)
+        
+        # 원과호 시트 고유 ID
         doc = client.open_by_key("17-7C-Ut21uGF_IpAd3H25VEK9wUW0J9uYKcwbxTvJeQ")
         return doc.worksheet("재고내역"), doc.worksheet("출고기록")
     except Exception as e:
-        st.error(f"❌ 시트 연결 실패: {e}"); return None, None
+        st.error(f"❌ 시트 연결 실패: {e}\n(Streamlit Settings > Secrets 설정을 확인해 주세요.)")
+        return None, None
 
-# --- 3. 데이터 정제 및 검수 로직 (노란색 강조용) ---
+# --- 3. 데이터 정제 및 검수 로직 ---
 def format_phone_number(phone):
     if pd.isna(phone) or str(phone).strip() in ["", "nan"]: return phone
     clean = re.sub(r'\D', '', str(phone))
@@ -51,33 +58,29 @@ def process_excel(df):
         df['주문수량'] = pd.to_numeric(df['주문수량'], errors='coerce').fillna(1).astype(int)
         df.loc[df['옵션'].astype(str).str.contains('3개'), '주문수량'] *= 3
     
-    # 중복 체크 (합계 6개 초과)
+    # 중복 체크 및 6개 초과 마킹
     if all(c in df.columns for c in ['수령자명', '수령자휴대폰번호', '주소']):
         total_qty = df.groupby(['수령자명', '수령자휴대폰번호', '주소'])['주문수량'].transform('sum')
         mask_over_6 = total_qty > 6
     else: mask_over_6 = pd.Series([False] * len(df))
 
     for i, row in df.iterrows():
-        # [A] 이름 불일치
         if str(row.get('주문자명')) != str(row.get('수령자명')):
             df.at[i, '수령자명'] = f"(check) {row.get('수령자명', '')}"
-        # [B] 전화번호 숫자 비교
         r_raw, o_raw = str(row.get('수령자휴대폰번호', "")), str(row.get('주문자전화번호', ""))
         if re.sub(r'\D', '', r_raw) != re.sub(r'\D', '', o_raw) and o_raw not in ["", "nan"]:
             df.at[i, '수령자휴대폰번호'] = f"(check) {format_phone_number(r_raw)}"
-        # [C] 통관번호 누락/오류
         pccc = str(row.get('개인통관번호', "")).strip()
         if pccc == "" or pccc.lower() in ["nan", "none"] or not pccc.upper().startswith('P'):
             df.at[i, '개인통관번호'] = f"(check) {pccc}"
-        # [D] 수량 초과
         if mask_over_6.at[i]:
             df.at[i, '주문수량'] = f"(check) [합계:{int(total_qty.at[i])}개] {df.at[i, '주문수량']}"
     return df
 
-# --- 4. FIFO 분석 로직 ---
+# --- 4. FIFO 분석 및 시뮬레이션 (NaT 에러 방지 반영) ---
 def analyze_fifo_stock(order_df, ws_inv):
     all_inv_data = ws_inv.get_all_values()
-    # 열 위치: A(0)입고일, D(3)상품명, H(7)입고수, I(8)출고수, K(10)재고수, L(11)트래킹
+    # 열: A(입고일), D(상품명), H(입고수), I(출고수), K(재고수), L(트래킹)
     IDX_DATE_IN, IDX_PROD, IDX_IN, IDX_OUT, IDX_STOCK, IDX_TRACK = 0, 3, 7, 8, 10, 11
     
     inv_data = []
@@ -109,8 +112,13 @@ def analyze_fifo_stock(order_df, ws_inv):
             if current_stock > 0:
                 take = min(qty_needed, current_stock)
                 new_out, new_stock = s_out + take, s_in - (s_out + take)
-                preview_rows.append({"수령자": name, "상품명": eng_name, "현재고": int(current_stock), "출고": int(take), "잔여": int(new_stock), "트래킹": row[IDX_TRACK], "입고일": row[IDX_DATE_IN].strftime('%Y-%m-%d')})
-                task_list.append({'row': row.iloc[-1], 'updates': [(9, new_out, s_out), (11, new_stock, current_stock)], 'log': [today, name, eng_name, int(take), int(new_stock), row[IDX_TRACK], row[IDX_DATE_IN].strftime('%Y-%m-%d')]})
+                
+                # 날짜 NaT 체크
+                in_date = row[IDX_DATE_IN]
+                date_str = in_date.strftime('%Y-%m-%d') if pd.notnull(in_date) else "날짜없음"
+                
+                preview_rows.append({"수령자": name, "상품명": eng_name, "현재고": int(current_stock), "출고": int(take), "잔여": int(new_stock), "트래킹": row[IDX_TRACK], "입고일": date_str})
+                task_list.append({'row': row.iloc[-1], 'updates': [(9, new_out, s_out), (11, new_stock, current_stock)], 'log': [today, name, eng_name, int(take), int(new_stock), row[IDX_TRACK], date_str]})
                 order_msg.append(f"- {eng_name}/{row[IDX_TRACK]}/{int(take)}")
                 temp_inv_df.at[idx, IDX_OUT] = str(new_out); qty_needed -= take
         
@@ -119,8 +127,8 @@ def analyze_fifo_stock(order_df, ws_inv):
     return pd.DataFrame(preview_rows), task_list, "\n\n".join(board_msgs)
 
 # --- 5. UI 메인 ---
-st.set_page_config(page_title="해외주문 비서 v13.0", layout="wide")
-st.title("📦 해외주문처리 비서 (v13.0 전체 통합본)")
+st.set_page_config(page_title="원과호 비서 v14.0", layout="wide")
+st.title("📦 원과호 해외주문처리 비서 (v14.0 클라우드)")
 
 uploaded = st.file_uploader("📂 플레이오토 엑셀 파일 업로드", type=["xlsx"])
 
@@ -130,18 +138,19 @@ if uploaded:
         st.session_state.fname = uploaded.name
         st.session_state.last_tasks = []
 
-    # [1] 필수 검수 항목 섹션 (복구 완료!)
     df = st.session_state.df
+    
+    # [1] 상단 검수 항목
     check_rows = df[df.astype(str).apply(lambda row: row.str.contains('\(check\)').any(), axis=1)]
-    st.subheader(f"⚠️ 필수 검수 항목 ({len(check_rows)}건)")
-    if not check_rows.empty:
-        st.dataframe(check_rows.style.applymap(lambda x: 'background-color: #FFEB3B' if '(check)' in str(x) else ''), use_container_width=True)
-    else: st.success("✅ 모든 데이터가 정상입니다.")
+    with st.expander(f"⚠️ 필수 검수 항목 ({len(check_rows)}건)", expanded=not check_rows.empty):
+        if not check_rows.empty:
+            st.dataframe(check_rows.style.applymap(lambda x: 'background-color: #FFEB3B' if '(check)' in str(x) else ''), use_container_width=True)
+        else: st.success("✅ 모든 데이터가 정상입니다.")
 
     st.markdown("---")
     edited_df = st.data_editor(df, use_container_width=True, key="main_editor")
 
-    # [2] 재고 차감 시뮬레이션 및 승인 섹션
+    # [2] 재고 시뮬레이션 및 승인
     st.markdown("---")
     if st.button("🔍 재고 차감 시뮬레이션 실행"):
         ws_inv, _ = connect_google_sheet()
@@ -156,31 +165,29 @@ if uploaded:
         with c1:
             if st.button("🚀 전체 출고 승인 (시트 반영)"):
                 ws_i, ws_s = connect_google_sheet()
-                for t in st.session_state.tasks:
-                    for col, val, _ in t['updates']: ws_i.update_cell(t['row'], col, val)
-                ws_s.append_rows([t['log'] for t in st.session_state.tasks])
-                st.session_state.last_tasks = st.session_state.tasks
-                st.success("🎉 반영 완료!"); st.balloons()
-                st.text_area("📋 고배송 게시판 문구:", st.session_state.msgs, height=300)
+                if ws_i:
+                    for t in st.session_state.tasks:
+                        for col, val, _ in t['updates']: ws_i.update_cell(t['row'], col, val)
+                    ws_s.append_rows([t['log'] for t in st.session_state.tasks])
+                    st.session_state.last_tasks = st.session_state.tasks
+                    st.success("🎉 반영 완료!"); st.balloons()
+                    st.text_area("📋 고배송 문구:", st.session_state.msgs, height=300)
         with c2:
             if st.session_state.last_tasks and st.button("🔙 방금 작업 롤백"):
                 ws_i, _ = connect_google_sheet()
                 for t in st.session_state.last_tasks:
                     for col, _, old_val in t['updates']: ws_i.update_cell(t['row'], col, old_val)
                 st.session_state.last_tasks = []
-                st.warning("⏪ 재고 롤백 완료! (출고기록은 수동 삭제 필요)")
+                st.warning("⏪ 재고 롤백 완료!")
 
-    # [3] 통관 검증 및 다운로드 섹션 (복구 완료!)
+    # [3] 통관 검증 및 다운로드
     st.markdown("---")
-    st.subheader("🔍 통관 검증 및 최종 파일")
     col_a, col_b = st.columns([1, 1.5])
     with col_a:
         if st.button("🔗 검증용 텍스트 생성"):
             v_list = [f"{clean_check_text(r['수령자명'])}/{clean_check_text(r['개인통관번호'], True)}/{clean_check_text(r['수령자휴대폰번호'])}/{r.get('우편번호','')}" for _, r in edited_df.iterrows()]
-            st.text_area("GSI 검증 텍스트:", "\n".join(v_list), height=250)
-        
+            st.text_area("GSI 검증 텍스트:", "\n".join(v_list), height=200)
         towrap = io.BytesIO()
         with pd.ExcelWriter(towrap, engine='openpyxl') as writer: edited_df.to_excel(writer, index=False)
         st.download_button("💾 가공 주문서 다운로드", towrap.getvalue(), file_name=f"처리완료_{uploaded.name}")
-
-    with col_b: components.iframe("https://gsiexpress.com/pcc_chk.php", height=500, scrolling=True)
+    with col_b: components.iframe("https://gsiexpress.com/pcc_chk.php", height=450, scrolling=True)
