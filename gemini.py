@@ -24,15 +24,17 @@ def connect_google_sheet():
     try:
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         
-        # Secrets에서 데이터를 가져와 딕셔너리로 변환
+        # 1. Secrets에서 데이터를 딕셔너리로 가져옵니다.
         key_info = dict(st.secrets["gcp_service_account"])
         
-        # [핵심 보정] private_key 내부의 줄바꿈과 공백을 정밀하게 다듬습니다.
+        # 2. [필살기] private_key에 섞인 온갖 오타(공백, 이중줄바꿈 등)를 비서가 직접 청소합니다.
         if "private_key" in key_info:
-            raw_key = key_info["private_key"]
-            # 리터럴 \n을 실제 줄바꿈으로 변경하고 앞뒤 공백 제거
-            cleaned_key = raw_key.replace("\\n", "\n").strip()
-            key_info["private_key"] = cleaned_key
+            pk = key_info["private_key"]
+            # 리터럴 \n 문자를 실제 줄바꿈으로 변경
+            pk = pk.replace("\\n", "\n")
+            # 앞뒤 공백 및 불필요한 빈 줄 완벽 제거
+            pk = pk.strip()
+            key_info["private_key"] = pk
             
         creds = ServiceAccountCredentials.from_json_keyfile_dict(key_info, scope)
         client = gspread.authorize(creds)
@@ -41,6 +43,7 @@ def connect_google_sheet():
         doc = client.open_by_key("17-7C-Ut21uGF_IpAd3H25VEK9wUW0J9uYKcwbxTvJeQ")
         return doc.worksheet("재고내역"), doc.worksheet("출고기록")
     except Exception as e:
+        # 에러 메시지를 더 자세히 보여주도록 수정
         st.error(f"❌ 시트 연결 실패: {e}")
         return None, None
 
@@ -191,4 +194,5 @@ if uploaded:
         with pd.ExcelWriter(towrap, engine='openpyxl') as writer: edited_df.to_excel(writer, index=False)
         st.download_button("💾 가공 주문서 다운로드", towrap.getvalue(), file_name=f"처리완료_{uploaded.name}")
     with col_b: components.iframe("https://gsiexpress.com/pcc_chk.php", height=450, scrolling=True)
+
 
