@@ -24,11 +24,15 @@ def connect_google_sheet():
     try:
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         
-        # [수정] Secrets에서 데이터를 딕셔너리로 가져온 뒤 줄바꿈(\n) 오류를 보정합니다.
+        # Secrets에서 데이터를 가져와 딕셔너리로 변환
         key_info = dict(st.secrets["gcp_service_account"])
+        
+        # [핵심 보정] private_key 내부의 줄바꿈과 공백을 정밀하게 다듬습니다.
         if "private_key" in key_info:
-            # 복사 과정에서 생길 수 있는 \n 문자열 꼬임을 방지합니다.
-            key_info["private_key"] = key_info["private_key"].replace("\\n", "\n")
+            raw_key = key_info["private_key"]
+            # 리터럴 \n을 실제 줄바꿈으로 변경하고 앞뒤 공백 제거
+            cleaned_key = raw_key.replace("\\n", "\n").strip()
+            key_info["private_key"] = cleaned_key
             
         creds = ServiceAccountCredentials.from_json_keyfile_dict(key_info, scope)
         client = gspread.authorize(creds)
@@ -38,7 +42,6 @@ def connect_google_sheet():
         return doc.worksheet("재고내역"), doc.worksheet("출고기록")
     except Exception as e:
         st.error(f"❌ 시트 연결 실패: {e}")
-        st.info("💡 Streamlit Settings > Secrets 설정이 올바른지 확인해주세요.")
         return None, None
 
 # --- 3. 데이터 정제 및 검수 로직 ---
@@ -188,3 +191,4 @@ if uploaded:
         with pd.ExcelWriter(towrap, engine='openpyxl') as writer: edited_df.to_excel(writer, index=False)
         st.download_button("💾 가공 주문서 다운로드", towrap.getvalue(), file_name=f"처리완료_{uploaded.name}")
     with col_b: components.iframe("https://gsiexpress.com/pcc_chk.php", height=450, scrolling=True)
+
